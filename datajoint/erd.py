@@ -35,6 +35,7 @@ def _get_tier(table_name):
         except StopIteration:
             return None
 
+
 if not erd_active:
     class ERD:
         """
@@ -207,7 +208,11 @@ else:
             graph = nx.DiGraph(self).subgraph(nodes)
             nx.set_node_attributes(graph, 'node_type', {n: _get_tier(n) for n in graph})
             # relabel nodes to class names
-            mapping = {node: (lookup_class_name(node, self.context) or node) for node in graph.nodes()}
+            mapping = {node: (node) for node in graph.nodes()}
+            clean_context = dict((k, self.context[k]) for k in self.context
+                                 if '_' not in k)  # hack for ipython '_' var
+            mapping = {node: (lookup_class_name(node, clean_context) or node)
+                       for node in graph.nodes()}
             new_names = [mapping.values()]
             if len(new_names) > len(set(new_names)):
                 raise DataJointError('Some classes have identical names. The ERD cannot be plotted.')
@@ -230,7 +235,7 @@ else:
                              size=0.4*scale, fixed=False),
                 Lookup: dict(shape='plaintext', color='#00000020', fontcolor='black', fontsize=round(scale*8),
                              size=0.4*scale, fixed=False),
-                Computed: dict(shape='circle', color='#FF000020', fontcolor='#7F0000A0', fontsize=round(scale*10),
+                Computed: dict(shape='ellipse', color='#FF000020', fontcolor='#7F0000A0', fontsize=round(scale*10),
                                size=0.3*scale, fixed=True),
                 Imported: dict(shape='ellipse', color='#00007F40', fontcolor='#00007FA0', fontsize=round(scale*10),
                                size=0.4*scale, fixed=False),
