@@ -40,4 +40,3 @@ class Folder:
         return self.client.remove_objects(self.bucket, itertools.islice(
             (x.object_name for x in self.client.list_objects(self.bucket, self.remote_path + '/')
              if x not in exclude), max_count))
-
