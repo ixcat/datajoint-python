@@ -1,3 +1,4 @@
+from decimal import Decimal
 from nose.tools import assert_true, assert_false, assert_equals
 from . import schema
 from datajoint.jobs import ERROR_MESSAGE_LENGTH, TRUNCATION_APPENDIX
@@ -15,28 +16,28 @@ def test_reserve_job():
     assert_true(subjects)
     table_name = 'fake_table'
     # reserve jobs
-    for key in subjects.fetch.keys():
+    for key in subjects.fetch('KEY'):
         assert_true(schema.schema.jobs.reserve(table_name, key),
                     'failed to reserve a job')
     # refuse jobs
-    for key in subjects.fetch.keys():
+    for key in subjects.fetch('KEY'):
         assert_false(schema.schema.jobs.reserve(table_name, key),
                      'failed to respect reservation')
     # complete jobs
-    for key in subjects.fetch.keys():
+    for key in subjects.fetch('KEY'):
         schema.schema.jobs.complete(table_name, key)
     assert_false(schema.schema.jobs,
                  'failed to free jobs')
     # reserve jobs again
-    for key in subjects.fetch.keys():
+    for key in subjects.fetch('KEY'):
         assert_true(schema.schema.jobs.reserve(table_name, key),
                     'failed to reserve new jobs')
     # finish with error
-    for key in subjects.fetch.keys():
+    for key in subjects.fetch('KEY'):
         schema.schema.jobs.error(table_name, key,
                                  "error message")
     # refuse jobs with errors
-    for key in subjects.fetch.keys():
+    for key in subjects.fetch('KEY'):
         assert_false(schema.schema.jobs.reserve(table_name, key),
                      'failed to ignore error jobs')
     # clear error jobs
@@ -75,6 +76,13 @@ def test_sigint():
     assert_equals(error_message, 'KeyboardInterrupt')
     schema.schema.jobs.delete()
 
+def test_key_pack_testing():
+    jobs = schema.schema.jobs
+    key = dict(a='string', b=int, c=Decimal())
+    assert jobs.packable_or_none(key) is None
+    key.pop('c')
+    assert jobs.packable_or_none(key) is not None
+
 
 def test_sigterm():
     # clear out job table
@@ -100,7 +108,7 @@ def test_long_error_message():
     assert_true(subjects)
     table_name = 'fake_table'
 
-    key = list(subjects.fetch.keys())[0]
+    key = list(subjects.fetch('KEY'))[0]
 
     # test long error message
     schema.schema.jobs.reserve(table_name, key)

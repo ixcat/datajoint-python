@@ -1,6 +1,7 @@
 import collections
 from itertools import count
 import logging
+import inspect
 import numpy as np
 import re
 import datetime
@@ -11,65 +12,23 @@ from .fetch import Fetch, Fetch1
 logger = logging.getLogger(__name__)
 
 
-def equal_ignore_case(str1, str2):
-    try:
-        return str1.upper() == str2.upper()
-    except AttributeError:
-        return False
-
-
-def restricts_to_same(arg):
+def assert_join_compatibility(rel1, rel2):
     """
-    returns True if restriction with arg produces the same result as not restricting at all
+    Determine if relations rel1 and rel2 are join-compatible.  To be join-compatible, the matching attributes
+    in the two relations must be in the primary key of one or the other relation.
+    Raises an exception if not compatible.
+    :param rel1: A RelationalOperand object
+    :param rel2: A RelationalOperand object
     """
-    return (isinstance(arg, U) or arg is True or equal_ignore_case(arg, "TRUE") or
-            isinstance(arg, Not) and restricts_to_empty(arg.restriction))
-
-
-def restricts_to_empty(arg):
-    """
-    returns True if restriction with arg must produce the empty relation.
-    """
-    or_lists = (list, set, tuple, np.ndarray)
-    return (arg is None or (isinstance(arg, AndList) and any(restricts_to_empty(r) for r in arg)) or
-            arg is None or arg is False or equal_ignore_case(arg, "FALSE") or
-            isinstance(arg, or_lists) and len(arg) == 0 or  # empty OR-list equals FALSE
-            isinstance(arg, Not) and restricts_to_same(arg.restriction))
-
-
-class OrList(list):
-    """
-    A list of conditions to restrict a relation.  The conditions are OR-ed.
-    If any restriction is True, then the overall condition is True.
-    Each condition can be a AndList.
-
-    Example:
-    rel2 = rel & dj.ORList((cond1, cond2, cond3))
-    is equivalent to
-    rel2 = rel & [cond1, cond2, cond3]
-    """
-
-    @staticmethod
-    def _recurse(other):
-        for item in other:
-            if isinstance(item, OrList):
-                yield from OrList._recurse(item)  # flatten list
-            else:
-                if not isinstance(item, AndList):
-                    yield item
-                elif len(item) == 0:
-                    yield True
-                elif len(item) == 1:
-                    if isinstance(item[0], OrList):
-                        OrList._recurse(item[0])
-                    else:
-                        yield item[0]
-                else:
-                    yield item
-
-    def __init__(self, other):
-        lst = list(self._recurse(other))
-        super().__init__([True] if any(i is True for i in lst) else lst)
+    for rel in (rel1, rel2):
+        if not isinstance(rel, (U, RelationalOperand)):
+            raise DataJointError('Object %r is not a relation and cannot be joined.' % rel)
+    if not isinstance(rel1, U) and not isinstance(rel2, U):  # dj.U is always compatible
+        try:
+            raise DataJointError("Cannot join relations on dependent attribute `%s`" % next(r for r in set(
+                rel1.heading.dependent_attributes).intersection(rel2.heading.dependent_attributes)))
+        except StopIteration:
+            pass
 
 
 class AndList(list):
@@ -84,24 +43,12 @@ class AndList(list):
     rel2 = rel & cond1 & cond2 & cond3
     """
 
-    def set(self, items):
-        self.clear()
-        self.append(items)
-
-    def append(self, item):
-        # append item, reducing nesting
-        if isinstance(item, AndList):
-            self.extend(item)
-        elif isinstance(item, OrList):
-            if not item:  # an empty OrList is equivalent to False
-                super().append(False)
-            else:  # an OrList with one element is equivalent to the element
-                super().append(item[0] if len(item) == 1 else item)
+    def append(self, restriction):
+        if isinstance(restriction, AndList):
+            # extend to reduce nesting
+            self.extend(restriction)
         else:
-            super().append(item)
-        # an AndList with a False in it is False
-        if len(self) > 1 and any(i is False for i in self):
-            self.set(False)
+            super().append(restriction)
 
 
 class RelationalOperand:
@@ -110,18 +57,18 @@ class RelationalOperand:
     RelationalOperand objects link other relational operands with relational operators.
     The leaves of this tree of objects are base relations.
     When fetching data from the database, this tree of objects is compiled into an SQL expression.
-    RelationalOperand operators are restrict, join, proj, and aggregate.
+    RelationalOperand operators are restrict, join, proj, and aggr.
     """
 
     def __init__(self, arg=None):
         if arg is None:  # initialize
             # initialize
-            self._restrictions = AndList()
+            self._restriction = AndList()
             self._distinct = False
             self._heading = None
         else:  # copy
             assert isinstance(arg, RelationalOperand), 'Cannot make RelationalOperand from %s' % arg.__class__.__name__
-            self._restrictions = AndList(arg._restrictions)
+            self._restriction = AndList(arg._restriction)
             self._distinct = arg.distinct
             self._heading = arg._heading
 
@@ -150,78 +97,97 @@ class RelationalOperand:
         return self._distinct
 
     @property
-    def restrictions(self):
+    def restriction(self):
         """
         :return:  The AndList of restrictions applied to the relation.
         """
-        assert isinstance(self._restrictions, AndList)
-        return self._restrictions
-
-    @property
-    def is_restricted(self):
-        return len(self.restrictions) > 0
+        assert isinstance(self._restriction, AndList)
+        return self._restriction
 
     @property
     def primary_key(self):
         return self.heading.primary_key
 
+    def _make_condition(self, arg):
+        """
+        Translate the input arg into the equivalent SQL condition (a string)
+        :param arg: any valid restriction object.
+        :return: an SQL condition string.  It may also be a boolean that is intended to be treated as a string.
+        """
+        negate = False
+        while isinstance(arg, Not):
+            negate = not negate
+            arg = arg.restriction
+        template = "NOT (%s)" if negate else "%s"
+
+        # restrict by string
+        if isinstance(arg, str):
+            return template % arg.strip()
+
+        # restrict by AndList
+        if isinstance(arg, AndList):
+            # discard all Trues
+            items = [item for item in (self._make_condition(i) for i in arg) if item is not True]
+            if any(item is False for item in items):
+                return negate  # if any item is False, the whole thing is False
+            if not items:
+                return not negate   # and empty AndList is True
+            return template % ('(' + ') AND ('.join(items) + ')')
+
+        # restriction by dj.U evaluates to True
+        if isinstance(arg, U):
+            return not negate
+
+        # restrict by boolean
+        if isinstance(arg, bool):
+            return negate != arg
+
+        # restrict by a mapping such as a dict -- convert to an AndList of string equality conditions
+        if isinstance(arg, collections.abc.Mapping):
+            return template % self._make_condition(
+                AndList('`%s`=%r' % (k, (v if not isinstance(v, (
+                    datetime.date, datetime.datetime, datetime.time, decimal.Decimal)) else str(v)))
+                        for k, v in arg.items() if k in self.heading))
+
+        # restrict by a numpy record -- convert to an AndList of string equality conditions
+        if isinstance(arg, np.void):
+            return template % self._make_condition(
+                AndList(('`%s`='+('%s' if self.heading[k].numeric else '"%s"')) % (k, arg[k])
+                        for k in arg.dtype.fields if k in self.heading))
+
+        # restrict by a Relation class -- triggers instantiation
+        if inspect.isclass(arg) and issubclass(arg, RelationalOperand):
+            arg = arg()
+
+        # restrict by another relation (aka semijoin and antijoin)
+        if isinstance(arg, RelationalOperand):
+            assert_join_compatibility(self, arg)
+            common_attributes = [q for q in self.heading.names if q in arg.heading.names]
+            return (
+                # without common attributes, any non-empty relation matches everything
+                (not negate if arg else negate) if not common_attributes
+                else '({fields}) {not_}in ({subquery})'.format(
+                    fields='`' + '`,`'.join(common_attributes) + '`',
+                    not_="not " if negate else "",
+                    subquery=arg.make_sql(common_attributes)))
+
+        # if iterable (but not a string, a relation, or an AndList), treat as an OrList
+        try:
+            or_list = [self._make_condition(q) for q in arg if q is not False]
+        except TypeError:
+            raise DataJointError('Invalid restriction type %r' % arg)
+        else:
+            if any(item is True for item in or_list):  # if any item is True, the whole thing is True
+                return not negate
+            return template % ('(%s)' % ' OR '.join(or_list)) if or_list else negate  # an empty or list is False
+
     @property
     def where_clause(self):
         """
-        convert self.restrictions to the SQL WHERE clause
+        convert self.restriction to the SQL WHERE clause
         """
-
-        def make_condition(arg, _negate=False):
-            if isinstance(arg, str):
-                return arg, _negate
-            elif isinstance(arg, AndList):
-                return '(' + ' AND '.join([make_condition(element)[0] for element in arg]) + ')', _negate
-            elif isinstance(arg, bool):
-                return 'FALSE' if _negate == arg else 'TRUE', False
-            # semijoin or antijoin
-            elif isinstance(arg, RelationalOperand):
-                common_attributes = [q for q in self.heading.names if q in arg.heading.names]
-                if not common_attributes:
-                    condition = 'FALSE' if _negate else 'TRUE'
-                else:
-                    condition = '({fields}) {not_}in ({subquery})'.format(
-                        fields='`' + '`,`'.join(common_attributes) + '`',
-                        not_="not " if _negate else "",
-                        subquery=arg.make_sql(common_attributes))
-                return condition, False  # _negate is cleared
-
-            # mappings are turned into ANDed equality conditions
-            elif isinstance(arg, collections.abc.Mapping):
-                condition = ['`%s`=%r' % (k, (v if not isinstance(v, (
-                    datetime.date, datetime.datetime, datetime.time, decimal.Decimal)) else str(v)))
-                             for k, v in arg.items() if k in self.heading]
-            elif isinstance(arg, np.void):
-                # element of a record array
-                condition = [('`%s`='+('%s' if self.heading[k].numeric else '"%s"')) % (k, arg[k])
-                             for k in arg.dtype.fields if k in self.heading]
-            else:
-                raise DataJointError('Invalid restriction type')
-            return ' AND '.join(condition) if condition else 'TRUE', _negate
-
-        if not self.is_restricted:
-            return ''
-
-        # An empty or-list in the restrictions immediately causes an empty result
-        if restricts_to_empty(self.restrictions):
-            return ' WHERE FALSE'
-
-        conditions = []
-        for item in self.restrictions:
-            negate = isinstance(item, Not)
-            if negate:
-                item = item.restriction  # NOT is added below
-            if isinstance(item, (list, tuple, set, np.ndarray)):
-                item = '(' + ') OR ('.join(
-                    [make_condition(q)[0] for q in item if q is not restricts_to_empty(q)]) + ')'
-            else:
-                item, negate = make_condition(item, negate)
-            conditions.append(('NOT (%s)' if negate else '(%s)') % item)
-        return ' WHERE ' + ' AND '.join(conditions)
+        cond = self._make_condition(self.restriction)
+        return '' if cond is True else ' WHERE %s' % cond
 
     def get_select_fields(self, select_fields=None):
         """
@@ -258,7 +224,7 @@ class RelationalOperand:
         """
         return Projection.create(self, attributes, named_attributes)
 
-    def aggregate(self, group, *attributes, keep_all_rows=False, **named_attributes):
+    def aggr(self, group, *attributes, keep_all_rows=False, **named_attributes):
         """
         Relational aggregation/projection operator
         :param group:  relation whose tuples can be used in aggregation operators
@@ -270,7 +236,7 @@ class RelationalOperand:
         return GroupBy.create(self, group, keep_all_rows=keep_all_rows,
                               attributes=attributes, named_attributes=named_attributes)
 
-    aggr = aggregate  # shorthand
+    aggregate = aggr  # aliased name for aggr
 
     def __iand__(self, restriction):
         """
@@ -317,7 +283,6 @@ class RelationalOperand:
         Successive restrictions are combined using the logical AND.
         The AndList class is provided to play the role of successive restrictions.
         Any relation, collection, or sequence other than an AndList are treated as OrLists.
-        However, the class OrList is still provided for cases when explicitness is required.
         Inverse restriction is accomplished by either using the subtraction operator or the Not class.
 
         The expressions in each row equivalent:
@@ -355,22 +320,9 @@ class RelationalOperand:
         :param restriction: a sequence or an array (treated as OR list), another relation, an SQL condition string, or
             an AndList.
         """
-        assert not self.heading.expressions or isinstance(self, GroupBy), "Cannot restrict in place" \
-                                                                          " a projection with renamed attributes."
-        if not restricts_to_same(restriction):
-            self.restrictions.append(restriction)
-        elif restricts_to_empty(restriction):
-            self.restrictions.set(False)
-        return self
-
-    def allow(self, arg):
-        assert not self.heading.expressions or isinstance(self, GroupBy), "Cannot restrict in place" \
-                                                                          " a projection with renamed attributes."
-        if self.restrictions:
-            if restricts_to_same(arg):
-                self.restrictions.clear()
-            else:
-                self.restrictions.set(OrList([self.restrictions, arg]))
+        assert not self.heading.expressions or isinstance(self, GroupBy), "Cannot restrict a projection" \
+                                                                          " with renamed attributes in place."
+        self.restriction.append(restriction)
         return self
 
     @property
@@ -383,7 +335,7 @@ class RelationalOperand:
 
     def attributes_in_restriction(self):
         """
-        :return: list of attributes that are probably used in the restrictions.
+        :return: list of attributes that are probably used in the restriction.
             The function errs on the side of false positives.
             For example, if the restriction is "val='id'", then the attribute 'id' would be flagged.
             This is used internally for optimizing SQL statements.
@@ -434,10 +386,10 @@ class RelationalOperand:
             }
             .Relation th{
                 background: #A0A0A0; color: #ffffff; padding:4px; border:#f0e0e0 1px solid;
-                font-weight: normal; font-family: monospace; font-size: 75%;
+                font-weight: normal; font-family: monospace; font-size: 100%;
             }
             .Relation td{
-                padding:4px; border:#f0e0e0 1px solid; font-size:75%;
+                padding:4px; border:#f0e0e0 1px solid; font-size:100%;
             }
             .Relation tr:nth-child(odd){
                 background: #ffffff;
@@ -448,7 +400,6 @@ class RelationalOperand:
             /* Tooltip container */
             .djtooltip {
             }
-
             /* Tooltip text */
             .djtooltip .djtooltiptext {
                 visibility: hidden;
@@ -458,13 +409,10 @@ class RelationalOperand:
                 text-align: center;
                 padding: 5px 0;
                 border-radius: 6px;
-
                 /* Position the tooltip text - see examples below! */
                 position: absolute;
                 z-index: 1;
             }
-
-
             #primary {
                 font-weight: bold;
                 color: black;
@@ -485,7 +433,6 @@ class RelationalOperand:
                                 <p id="{primary}">{column}</p>
                                 <span class="djtooltiptext">{comment}</span>
                             </div>"""
-
         return """
         {css}
         {title}
@@ -536,6 +483,29 @@ class RelationalOperand:
         """
         return bool(self & item)  # May be optimized e.g. using an EXISTS query
 
+    def __iter__(self):
+        self._iter_only_key = all(v.in_key for v in self.heading.attributes.values())
+        self._iter_keys = self.fetch('KEY')
+        return self
+
+    def __next__(self):
+        try:
+            key = self._iter_keys.pop(0)
+        except AttributeError:
+            # self._iter_keys is missing because __iter__ has not been called.
+            raise TypeError("'RelationalOperand' object is not an iterator. Use iter(obj) to create an iterator.")
+        except IndexError:
+            raise StopIteration
+        else:
+            if self._iter_only_key:
+                return key
+            else:
+                try:
+                    return (self & key).fetch1()
+                except DataJointError:
+                    # The data may have been deleted since the moment the keys were fetched -- move on to next entry.
+                    return next(self)
+
     def cursor(self, offset=0, limit=None, order_by=None, as_dict=False):
         """
         See Relation.fetch() for input description.
@@ -556,9 +526,8 @@ class Not:
     """
     invert restriction
     """
-
     def __init__(self, restriction):
-        self.restriction = True if isinstance(restriction, U) else restriction
+        self.restriction = restriction
 
 
 class Join(RelationalOperand):
@@ -580,8 +549,9 @@ class Join(RelationalOperand):
     @classmethod
     def create(cls, arg1, arg2, keep_all_rows=False):
         obj = cls()
-        if not isinstance(arg1, RelationalOperand) or not isinstance(arg2, RelationalOperand):
-            raise DataJointError('a relation can only be joined with another relation')
+        if inspect.isclass(arg2) and issubclass(arg2, RelationalOperand):
+            arg2 = arg2()   # instantiate if joining with a class
+        assert_join_compatibility(arg1, arg2)
         if arg1.connection != arg2.connection:
             raise DataJointError("Cannot join relations from different connections.")
         obj._connection = arg1.connection
@@ -589,14 +559,9 @@ class Join(RelationalOperand):
         obj._arg2 = cls.make_argument_subquery(arg2)
         obj._distinct = obj._arg1.distinct or obj._arg2.distinct
         obj._left = keep_all_rows
-        try:
-            # ensure no common dependent attributes
-            raise DataJointError("Cannot join relations on dependent attribute `%s`" % next(r for r in set(
-                obj._arg1.heading.dependent_attributes).intersection(obj._arg2.heading.dependent_attributes)))
-        except StopIteration:
-            obj._heading = obj._arg1.heading.join(obj._arg2.heading)
-            obj.restrict(obj._arg1.restrictions)
-            obj.restrict(obj._arg2.restrictions)
+        obj._heading = obj._arg1.heading.join(obj._arg2.heading)
+        obj.restrict(obj._arg1.restriction)
+        obj.restrict(obj._arg2.restriction)
         return obj
 
     @staticmethod
@@ -633,6 +598,8 @@ class Union(RelationalOperand):
     @classmethod
     def create(cls, arg1, arg2):
         obj = cls()
+        if inspect.isclass(arg2) and issubclass(arg2, RelationalOperand):
+            obj = obj()  # instantiate if a class
         if not isinstance(arg1, RelationalOperand) or not isinstance(arg2, RelationalOperand):
             raise DataJointError('a relation can only be unioned with another relation')
         if arg1.connection != arg2.connection:
@@ -706,7 +673,7 @@ class Projection(RelationalOperand):
         else:
             obj._arg = arg
             obj._heading = obj._arg.heading.project(attributes, named_attributes)
-            obj &= arg.restrictions  # copy restrictions when no subquery
+            obj &= arg.restriction  # copy restriction when no subquery
         return obj
 
     @staticmethod
@@ -729,7 +696,7 @@ class GroupBy(RelationalOperand):
     """
     GroupBy(rel, comp1='expr1', ..., compn='exprn')  produces a relation with the primary key specified by rel.heading.
     The computed arguments comp1, ..., compn use aggregation operators on the attributes of rel.
-    GroupBy is used RelationalOperand.aggregate and U.aggregate.
+    GroupBy is used RelationalOperand.aggr and U.aggr.
     GroupBy is a private class in DataJoint, not exposed to users.
     """
 
@@ -745,8 +712,9 @@ class GroupBy(RelationalOperand):
 
     @classmethod
     def create(cls, arg, group, attributes=None, named_attributes=None, keep_all_rows=False):
-        if not isinstance(group, RelationalOperand):
-            raise DataJointError('a relation can only be joined with another relation')
+        if inspect.isclass(group) and issubclass(group, RelationalOperand):
+            group = group()   # instantiate if a class
+        assert_join_compatibility(arg, group)
         obj = cls()
         obj._keep_all_rows = keep_all_rows
         if not (set(group.primary_key) - set(arg.primary_key) or set(group.primary_key) == set(arg.primary_key)):
@@ -840,22 +808,22 @@ class U:
     The following expression produces a relation with one tuple and one attribute s containing the total number
     of tuples in relation:
 
-    >>> dj.U().aggregate(relation, n='count(*)')
+    >>> dj.U().aggr(relation, n='count(*)')
 
     The following expression produces a relation with one tuple containing the number n of distinct values of attr
     in relation.
 
-    >>> dj.U().aggregate(relation, n='count(distinct attr)')
+    >>> dj.U().aggr(relation, n='count(distinct attr)')
 
     The following expression produces a relation with one tuple and one attribute s containing the total sum of attr
     from relation:
 
-    >>> dj.U().aggregate(relation, s='sum(attr)')   # sum of attr from the entire relation
+    >>> dj.U().aggr(relation, s='sum(attr)')   # sum of attr from the entire relation
 
     The following expression produces a relation with the count n of tuples in relation containing each unique
     combination of values in attr1 and attr2.
 
-    >>> dj.U(attr1,attr2).aggregate(relation, n='count(*)')
+    >>> dj.U(attr1,attr2).aggr(relation, n='count(*)')
 
     Joins:
 
@@ -876,6 +844,8 @@ class U:
         return self._primary_key
 
     def __and__(self, relation):
+        if inspect.isclass(relation) and issubclass(relation, RelationalOperand):
+            relation = relation()   # instantiate if a class
         if not isinstance(relation, RelationalOperand):
             raise DataJointError('Relation U can only be restricted with another relation.')
         return Projection.create(relation, attributes=self.primary_key,
@@ -888,17 +858,19 @@ class U:
         :param relation: other relation
         :return: a copy of the other relation with the primary key extended.
         """
+        if inspect.isclass(relation) and issubclass(relation, RelationalOperand):
+            relation = relation()   # instantiate if a class
         if not isinstance(relation, RelationalOperand):
             raise DataJointError('Relation U can only be joined with another relation.')
         copy = relation.__class__(relation)
         copy._heading = copy.heading.extend_primary_key(self.primary_key)
         return copy
 
-    def aggregate(self, group, **named_attributes):
+    def aggr(self, group, **named_attributes):
         """
-        Aggregation of the type U('attr1','attr2').aggregate(rel, computation="expression")
+        Aggregation of the type U('attr1','attr2').aggr(rel, computation="expression")
         has the primary key ('attr1','attr2') and performs aggregation computations for all matching tuples of relation.
-        :param group:  The other relation which will be aggregated
+        :param group:  The other relation which will be aggregated.
         :param named_attributes: computations of the form new_attribute="sql expression on attributes of group"
         :return: The new relation
         """
@@ -907,4 +879,4 @@ class U:
             if self.primary_key else
             Projection.create(group, attributes=(), named_attributes=named_attributes, include_primary_key=False))
 
-    aggr = aggregate  # shorthand
+    aggregate = aggr  # alias for aggr

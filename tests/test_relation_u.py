@@ -31,7 +31,6 @@ class TestU:
         assert_list_equal(rel.primary_key, (rel & 'trial_id>3').primary_key)
         assert_list_equal((dj.U('start_time') & self.trial).primary_key, ['start_time'])
 
-
     @staticmethod
     @raises(dj.DataJointError)
     def test_invalid_restriction():
@@ -63,7 +62,7 @@ class TestU:
     def test_argmax(self):
         rel = schema.Test()
         # get the tuples corresponding to maximum value
-        mx = rel & dj.U().aggr(rel, value='max(value)')
+        mx = (rel * dj.U().aggr(rel, mx='max(value)')) & 'mx=value'
         assert_equal(mx.fetch('value')[0], max(rel.fetch('value')))
 
     def test_aggr(self):

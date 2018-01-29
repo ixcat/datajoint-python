@@ -10,13 +10,20 @@ from . import DataJointError
 
 _base_regexp = r'[a-z][a-z0-9]*(_[a-z][a-z0-9]*)*'
 
+# attributes that trigger instantiation of user classes
+supported_class_attrs = set((
+    'key_source', 'describe', 'populate', 'progress',
+    'proj', 'aggr', 'heading', 'fetch', 'fetch1',
+    'insert', 'insert1', 'drop', 'drop_quick',
+    'delete', 'delete_quick'))
+
 
 class OrderedClass(type):
     """
     Class whose members are ordered
     See https://docs.python.org/3/reference/datamodel.html#metaclass-example
 
-    TODO:  In Python 3.6, this will no longer be necessary and should be removed (PEP 520)
+    Note:  Since Python 3.6, this will no longer be necessary and should be removed (PEP 520)
     https://www.python.org/dev/peps/pep-0520/
     """
     @classmethod
@@ -32,6 +39,26 @@ class OrderedClass(type):
         if hasattr(cls, '_ordered_class_members'):
             cls._ordered_class_members.append(name)
         super().__setattr__(name, value)
+
+    def __getattribute__(cls, name):
+        # trigger instantiation for supported class attrs
+        return (cls().__getattribute__(name) if name in supported_class_attrs
+                else super().__getattribute__(name))
+
+    def __and__(cls, arg):
+        return cls() & arg
+
+    def __sub__(cls, arg):
+        return cls() - arg
+
+    def __mul__(cls, arg):
+        return cls() * arg
+
+    def __add__(cls, arg):
+        return cls() + arg
+
+    def __iter__(cls):
+        return iter(cls())
 
 
 class UserRelation(BaseRelation, metaclass=OrderedClass):
@@ -67,9 +94,10 @@ class UserRelation(BaseRelation, metaclass=OrderedClass):
 
     @ClassProperty
     def full_table_name(cls):
-        if cls.database is None:
-            raise DataJointError('Class %s is not properly declared (schema decorator not applied?)' % cls.__name__)
-        return r"`{0:s}`.`{1:s}`".format(cls.database, cls.table_name)
+        if cls not in {Manual, Imported, Lookup, Computed, Part}:
+            if cls.database is None:
+                raise DataJointError('Class %s is not properly declared (schema decorator not applied?)' % cls.__name__)
+            return r"`{0:s}`.`{1:s}`".format(cls.database, cls.table_name)
 
 
 class Manual(UserRelation):

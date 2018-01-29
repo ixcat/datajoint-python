@@ -167,15 +167,13 @@ class BaseRelation(RelationalOperand):
                 except StopIteration:
                     pass
             fields = list(name for name in heading if name in rows.heading)
-
             query = '{command} INTO {table} ({fields}) {select}{duplicate}'.format(
                 command='REPLACE' if replace else 'INSERT',
                 fields='`' + '`,`'.join(fields) + '`',
                 table=self.full_table_name,
                 select=rows.make_sql(select_fields=fields),
                 duplicate=(' ON DUPLICATE KEY UPDATE `{pk}`=`{pk}`'.format(pk=self.primary_key[0])
-                           if skip_duplicates else '')
-            )
+                           if skip_duplicates else ''))
             self.connection.query(query)
             return
 
@@ -291,20 +289,27 @@ class BaseRelation(RelationalOperand):
                 else:
                     raise
 
-    def delete_quick(self):
+    def delete_quick(self, get_count=False):
         """
-        Deletes the table without cascading and without user prompt. If this table has any dependent
-        table(s), this will fail.
+        Deletes the table without cascading and without user prompt.
+        If this table has populated dependent tables, this will fail.
         """
         query = 'DELETE FROM ' + self.full_table_name + self.where_clause
         self.connection.query(query)
+        count = self.connection.query("SELECT ROW_COUNT()").fetchone()[0] if get_count else None
         self._log(query[:255])
+        return count
 
-    def delete(self):
+    def delete(self, verbose=True):
         """
         Deletes the contents of the table and its dependent tables, recursively.
         User is prompted for confirmation if config['safemode'] is set to True.
         """
+        already_in_transaction = self.connection.in_transaction
+        safe = config['safemode']
+        if already_in_transaction and safe:
+            raise DataJointError('Cannot delete within a transaction in safemode. '
+                                 'Set dj.config["safemode"] = False or complete the ongoing transaction first.')
         graph = self.connection.dependencies
         graph.load()
         delete_list = collections.OrderedDict()
@@ -312,19 +317,19 @@ class BaseRelation(RelationalOperand):
             if not table.isdigit():
                 delete_list[table] = FreeRelation(self.connection, table)
             else:
+                raise DataJointError('Cascading deletes across renamed foreign keys is not supported.  See issue #300.')
                 parent, edge = next(iter(graph.parents(table).items()))
                 delete_list[table] = FreeRelation(self.connection, parent).proj(
                     **{new_name: old_name
-                       for new_name, old_name in zip(edge['referencing_attributes'], edge['referenced_attributes'])
-                       if new_name != old_name})
+                       for new_name, old_name in edge['attr_map'].items() if new_name != old_name})
 
         # construct restrictions for each relation
         restrict_by_me = set()
         restrictions = collections.defaultdict(list)
         # restrict by self
-        if self.restrictions:
+        if self.restriction:
             restrict_by_me.add(self.full_table_name)
-            restrictions[self.full_table_name].append(self.restrictions)  # copy own restrictions
+            restrictions[self.full_table_name].append(self.restriction)  # copy own restrictions
         # restrict by renamed nodes
         restrict_by_me.update(table for table in delete_list if table.isdigit())  # restrict by all renamed nodes
         # restrict by tables restricted by a non-primary semijoin
@@ -344,35 +349,42 @@ class BaseRelation(RelationalOperand):
             if restrictions[name]:  # do not restrict by an empty list
                 r.restrict([r.proj() if isinstance(r, RelationalOperand) else r
                             for r in restrictions[name]])
-        # execute
-        do_delete = False  # indicate if there is anything to delete
-        if config['safemode']:  # pragma: no cover
-            print('The contents of the following tables are about to be deleted:')
+        if safe:
+            print('About to delete:')
 
-        for table, relation in list(delete_list.items()):   # need list to force a copy
-            if table.isdigit():
-                delete_list.pop(table)  # remove alias nodes from the delete list
-            else:
-                count = len(relation)
-                if count:
-                    do_delete = True
-                    if config['safemode']:
-                        print(table, '(%d tuples)' % count)
-                else:
-                    delete_list.pop(table)
-        if not do_delete:
-            if config['safemode']:
-                print('Nothing to delete')
+        if not already_in_transaction:
+            self.connection.start_transaction()
+        total = 0
+        try:
+            for r in reversed(list(delete_list.values())):
+                count = r.delete_quick(get_count=True)
+                total += count
+                if (verbose or safe) and count:
+                    print('{table}: {count} items'.format(table=r.full_table_name, count=count))
+        except:
+            # Delete failed, perhaps due to insufficient privileges. Cancel transaction.
+            if not already_in_transaction:
+                self.connection.cancel_transaction()
+            raise
         else:
-            if not config['safemode'] or user_choice("Proceed?", default='no') == 'yes':
-                already_in_transaction = self.connection._in_transaction
+            assert not (already_in_transaction and safe)
+            if not total:
+                print('Nothing to delete')
                 if not already_in_transaction:
-                    self.connection.start_transaction()
-                for r in reversed(list(delete_list.values())):
-                    r.delete_quick()
-                if not already_in_transaction:
-                    self.connection.commit_transaction()
-                print('Done')
+                    self.connection.cancel_transaction()
+            else:
+                if already_in_transaction:
+                    if verbose:
+                        print('The delete is pending within the ongoing transaction.')
+                else:
+                    if not safe or user_choice("Proceed?", default='no') == 'yes':
+                        self.connection.commit_transaction()
+                        if verbose or safe:
+                            print('Committed.')
+                    else:
+                        self.connection.cancel_transaction()
+                        if verbose or safe:
+                            print('Cancelled deletes.')
 
     def drop_quick(self):
         """
@@ -392,6 +404,9 @@ class BaseRelation(RelationalOperand):
         Drop the table and all tables that reference it, recursively.
         User is prompted for confirmation if config['safemode'] is set to True.
         """
+        if self.restriction:
+            raise DataJointError('A relation with an applied restriction condition cannot be dropped.'
+                                 ' Call drop() on the unrestricted BaseRelation.')
         self.connection.dependencies.load()
         do_drop = True
         tables = [table for table in self.connection.dependencies.descendants(self.full_table_name)
@@ -419,12 +434,13 @@ class BaseRelation(RelationalOperand):
         logger.warning('show_definition is deprecated.  Use describe instead.')
         return self.describe()
 
-    def describe(self):
+    def describe(self, printout=True):
         """
         :return:  the definition string for the relation using DataJoint DDL.
             This does not yet work for aliased foreign keys.
         """
-        self.connection.dependencies.load()
+        if self.full_table_name not in self.connection.dependencies:
+            self.connection.dependencies.load()
         parents = self.parents()
         in_key = True
         definition = '# ' + self.heading.table_info['comment'] + '\n'
@@ -437,9 +453,9 @@ class BaseRelation(RelationalOperand):
             attributes_thus_far.add(attr.name)
             do_include = True
             for parent_name, fk_props in list(parents.items()):  # need list() to force a copy
-                if attr.name in fk_props['referencing_attributes']:
+                if attr.name in fk_props['attr_map']:
                     do_include = False
-                    if attributes_thus_far.issuperset(fk_props['referencing_attributes']):
+                    if attributes_thus_far.issuperset(fk_props['attr_map']):
                         # simple foreign key
                         parents.pop(parent_name)
                         if not parent_name.isdigit():
@@ -448,22 +464,21 @@ class BaseRelation(RelationalOperand):
                         else:
                             # aliased foreign key
                             parent_name = self.connection.dependencies.in_edges(parent_name)[0][0]
-                            lst = [(attr, ref) for attr, ref in zip(
-                                fk_props['referencing_attributes'], fk_props['referenced_attributes'])
-                                   if ref != attr]
+                            lst = [(attr, ref) for attr, ref in fk_props['attr_map'].items() if ref != attr]
                             definition += '({attr_list}) -> {class_name}{ref_list}\n'.format(
                                 attr_list=','.join(r[0] for r in lst),
                                 class_name=lookup_class_name(parent_name, self.context) or parent_name,
                                 ref_list=('' if len(attributes_thus_far) - len(attributes_declared) == 1
                                           else '(%s)' % ','.join(r[1] for r in lst)))
-                            attributes_declared.update(fk_props['referencing_attributes'])
+                            attributes_declared.update(fk_props['attr_map'])
             if do_include:
                 attributes_declared.add(attr.name)
                 name = attr.name.lstrip('_')  # for external
                 definition += '%-20s : %-28s # %s\n' % (
                     name if attr.default is None else '%s=%s' % (name, attr.default),
                     '%s%s' % (attr.type, ' auto_increment' if attr.autoincrement else ''), attr.comment)
-        print(definition)
+        if printout:
+            print(definition)
         return definition
 
     def _update(self, attrname, value=None):
@@ -508,8 +523,7 @@ class BaseRelation(RelationalOperand):
             full_table_name=self.from_clause,
             attrname=attrname,
             placeholder=placeholder,
-            where_clause=self.where_clause
-        )
+            where_clause=self.where_clause)
         self.connection.query(command, args=(value, ) if value is not None else ())
 
 
@@ -534,7 +548,7 @@ def lookup_class_name(name, context, depth=3):
                 except AttributeError:
                     pass  # not a UserRelation -- cannot have part tables.
                 else:
-                    for part in (getattr(member, p) for p in parts if hasattr(member, p)):
+                    for part in (getattr(member, p) for p in parts if p[0].isupper() and hasattr(member, p)):
                         if inspect.isclass(part) and issubclass(part, BaseRelation) and part.full_table_name == name:
                             return '.'.join([node['context_name'], member_name, part.__name__]).lstrip('.')
             elif node['depth'] > 0 and inspect.ismodule(member) and member.__name__ != 'datajoint':
@@ -624,7 +638,7 @@ class Log(BaseRelation):
                 version=version + 'py',
                 host=platform.uname().node,
                 event=event), skip_duplicates=True, ignore_extra_fields=True)
-        except pymysql.err.OperationalError:
+        except DataJointError:
             logger.info('could not log event in table ~log')
 
     def delete(self):

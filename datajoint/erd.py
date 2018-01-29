@@ -3,6 +3,7 @@ import re
 import functools
 import io
 import warnings
+from .base_relation import BaseRelation
 
 try:
     from matplotlib import pyplot as plt
@@ -208,8 +209,8 @@ else:
             graph = nx.DiGraph(self).subgraph(nodes)
             nx.set_node_attributes(graph, 'node_type', {n: _get_tier(n) for n in graph})
             # relabel nodes to class names
-            clean_context = dict((k, self.context[k]) for k in self.context
-                                 if '_' not in k)  # hack for ipython '_' var
+            clean_context = dict((k, v) for k, v in self.context.items()
+                                 if not k.startswith('_'))  # exclude ipython's implicit variables
             mapping = {node: (lookup_class_name(node, clean_context) or node)
                        for node in graph.nodes()}
             new_names = [mapping.values()]
@@ -254,8 +255,15 @@ else:
                 node.set_fixedsize('shape' if props['fixed'] else False)
                 node.set_width(props['size'])
                 node.set_height(props['size'])
+                if name.split('.')[0] in self.context:
+                    cls = eval(name, self.context)
+                    assert(issubclass(cls, BaseRelation))
+                    description = cls().describe(printout=False).split('\n')
+                    description = (
+                        '-'*30 if q.startswith('---') else q.replace('->', '&#8594;') if '->' in q else q.split(':')[0]
+                        for q in description if not q.startswith('#'))
+                    node.set_tooltip('&#13;'.join(description))
                 node.set_label(name)
-                # node.set_margin(0.05)
                 node.set_color(props['color'])
                 node.set_style('filled')
 

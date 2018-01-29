@@ -2,12 +2,13 @@
 a schema for testing external attributes
 """
 
+import tempfile
 import datajoint as dj
 
 from . import PREFIX, CONN_INFO
 import numpy as np
 
-schema = dj.schema(PREFIX + '_extern', locals(), connection=dj.conn(**CONN_INFO))
+schema = dj.schema(PREFIX + '_extern', connection=dj.conn(**CONN_INFO))
 
 
 dj.config['external'] = {
@@ -25,16 +26,7 @@ dj.config['external-s3'] = {
     'aws_access_key_id': '1234567',
     'aws_secret_access_key': 'deadbeef'}
 
-dj.config['external-cache-s3'] = {
-    'protocol': 'cache-s3',
-    'bucket': 'testbucket.datajoint.io',
-    'location': '/datajoint-projects/test',
-    'aws_access_key_id': '1234567',
-    'aws_secret_access_key': 'deadbeef'}
-
-dj.config['external-cache'] = {
-    'protocol': 'cache',
-    'location': './cache'}
+dj.config['cache'] = tempfile.mkdtemp('dj-cache')
 
 
 @schema
@@ -42,13 +34,13 @@ class Simple(dj.Manual):
     definition = """
     simple  : int
     ---
-    item  : external-raw 
+    item  : external-raw
     """
 
 @schema
 class Seed(dj.Lookup):
     definition = """
-    seed :  int 
+    seed :  int
     """
     contents = zip(range(4))
 
@@ -58,7 +50,7 @@ class Dimension(dj.Lookup):
     definition = """
     dim  : int
     ---
-    dimensions  : blob  
+    dimensions  : blob
     """
     contents = (
         [0, [100, 50]],
