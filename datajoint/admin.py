@@ -1,4 +1,5 @@
 import pymysql
+from hashlib import sha1
 from getpass import getpass
 from .connection import conn
 from .settings import config
@@ -13,6 +14,10 @@ def set_password(new_password=None, connection=None, update_config=None):   # pr
         if new_password != confirm_password:
             print('Failed to confirm the password! Aborting password change.')
             return
+    # we hash on client to allow PROCESS privelege safely on dj-exclusive db's.
+    new_password = sha1(new_password).hexdigest()
+    connection.query("SET PASSWORD = CONCAT('*', UPPER(SHA1(UNHEX(('%s')))))" 
+        % new_password)
     connection.query("SET PASSWORD = PASSWORD('%s')" % new_password)
     print('Password updated.')
 
