@@ -14,11 +14,14 @@ def set_password(new_password=None, connection=None, update_config=None):   # pr
         if new_password != confirm_password:
             print('Failed to confirm the password! Aborting password change.')
             return
-    # we hash on client to allow PROCESS privelege safely on dj-exclusive db's.
-    new_password = sha1(new_password).hexdigest()
-    connection.query("SET PASSWORD = CONCAT('*', UPPER(SHA1(UNHEX(('%s')))))" 
-        % new_password)
-    connection.query("SET PASSWORD = PASSWORD('%s')" % new_password)
+    # hash on client to increase PROCESS privelege security on dj-only db's.
+    new_hash = sha1(new_password.encode()).hexdigest()
+    new_hash = connection.query("SELECT CONCAT('*', UPPER(SHA1(UNHEX('%s'))))" % new_hash).fetchall()[0]
+    # results in doubly hashed value..
+    connection.query("SET PASSWORD = '%s'" % new_hash)
+    # need to update mysql.user .... but this requires privs maybe.. so meh
+    # and also drifts mysql.user.password mysql.user.authentication_string 
+    # so would need to also select version();
     print('Password updated.')
 
     if update_config or (update_config is None and user_choice('Update local setting?') == 'yes'):
