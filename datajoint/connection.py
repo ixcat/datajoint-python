@@ -136,7 +136,6 @@ class Connection:
         """
         Connects to the database server.
         """
-        ssl_input = self.conn_info.pop('ssl_input')
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', '.*deprecated.*')
             try:
@@ -145,17 +144,15 @@ class Connection:
                     sql_mode="NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
                              "STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION",
                     charset=config['connection.charset'],
-                    **self.conn_info)
+                    **{k: v for k, v in self.conn_info.items() if k != 'ssl_input'})
             except client.err.InternalError:
                 if ssl_input is None:
-                    self.conn_info.pop('ssl')
                 self._conn = client.connect(
                     init_command=self.init_fun,
                     sql_mode="NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
                              "STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION",
                     charset=config['connection.charset'],
-                    **self.conn_info)
-        self.conn_info['ssl_input'] = ssl_input
+                    **{k: v for k, v in self.conn_info.items() if k not in ['ssl_input', 'ssl']})
         self._conn.autocommit(True)
 
     def close(self):
