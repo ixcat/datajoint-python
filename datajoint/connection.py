@@ -146,7 +146,6 @@ class Connection:
                     charset=config['connection.charset'],
                     **{k: v for k, v in self.conn_info.items() if k != 'ssl_input'})
             except client.err.InternalError:
-                if ssl_input is None:
                 self._conn = client.connect(
                     init_command=self.init_fun,
                     sql_mode="NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
