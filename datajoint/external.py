@@ -149,6 +149,7 @@ class ExternalTable(Table):
         """
         uuid = uuid_from_buffer(blob)
         self._upload_buffer(blob, self._make_uuid_path(uuid))
+        assert self.exists(self._make_uuid_path(uuid))
         # insert tracking info
         self.connection.query(
             "INSERT INTO {tab} (hash, size) VALUES (%s, {size}) ON DUPLICATE KEY "
